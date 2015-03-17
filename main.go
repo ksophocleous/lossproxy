@@ -124,7 +124,7 @@ func (u *UdpProxy) startRouter() error {
 				//fmt.Println(conn.RemoteAddr())
 				_, err := conn.Write(data)
 				if err != nil {
-					fmt.Printf("Send error: %s", err.Error())
+					fmt.Printf("Send error: %s\n", err.Error())
 				}
 			}
 		}
