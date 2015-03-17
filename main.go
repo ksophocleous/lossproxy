@@ -14,8 +14,9 @@ import (
 const udpBufferSize = 1500
 
 type udpProxyReporter struct {
-	loss   chan struct{}
-	routed chan struct{}
+	loss       chan struct{}
+	routed     chan struct{}
+	packetInfo chan int
 }
 
 // UdpProxy is responsible for a single route of udp packets
@@ -27,11 +28,10 @@ type UdpProxy struct {
 	StartBandwidthReporter bool
 	WaitChan               chan struct{}
 
-	lc         *net.UDPConn
-	packets    chan []byte
-	packetInfo chan int
-	shutdown   bool
-	reporter   *udpProxyReporter
+	lc       *net.UDPConn
+	packets  chan []byte
+	shutdown bool
+	reporter *udpProxyReporter
 }
 
 func (u *UdpProxy) stopProxy() error {
@@ -48,16 +48,16 @@ func (u *UdpProxy) startListener() error {
 	}
 
 	u.packets = make(chan []byte, 100)
+	u.reporter = &udpProxyReporter{}
 
 	if u.StartBandwidthReporter {
-		u.packetInfo = make(chan int, 100)
-		go u.startBandwidthReporter()
+		u.reporter.packetInfo = make(chan int, 100)
 	}
 
 	go func() {
 		defer u.lc.Close()
 		defer func() { close(u.packets) }()
-		defer func() { close(u.packetInfo) }()
+		defer func() { close(u.reporter.packetInfo) }()
 
 		b := make([]byte, udpBufferSize)
 		for {
@@ -73,7 +73,7 @@ func (u *UdpProxy) startListener() error {
 			if read > 0 {
 				b = b[:read]
 				if u.StartBandwidthReporter {
-					u.packetInfo <- read
+					u.reporter.packetInfo <- read
 				}
 				u.packets <- b
 				b = make([]byte, udpBufferSize)
@@ -94,19 +94,11 @@ func (u *UdpProxy) startRouter() error {
 		return err
 	}
 
-	var lossChan chan struct{}
-	var routedChan chan struct{}
-
 	u.WaitChan = make(chan struct{})
 
 	if u.StartReporter {
-		lossChan = make(chan struct{}, 10)
-		routedChan = make(chan struct{}, 10)
-
-		u.reporter = &udpProxyReporter{
-			loss:   lossChan,
-			routed: routedChan,
-		}
+		u.reporter.loss = make(chan struct{}, 10)
+		u.reporter.routed = make(chan struct{}, 10)
 		go u.reporter.startReporter()
 	}
 
@@ -121,13 +113,13 @@ func (u *UdpProxy) startRouter() error {
 				return
 			}
 			if len(data) > 0 {
-				if lossChan != nil {
+				if u.reporter != nil {
 					if rand.Int31n(100) < u.Loss {
 						//fmt.Println("loss occured")
-						lossChan <- struct{}{}
+						u.reporter.loss <- struct{}{}
 						continue
 					}
-					routedChan <- struct{}{}
+					u.reporter.routed <- struct{}{}
 				}
 				//fmt.Println(conn.RemoteAddr())
 				_, err := conn.Write(data)
@@ -143,7 +135,7 @@ func (u *UdpProxy) startRouter() error {
 
 func humanReadable(size float32) string {
 	size = size * 8
-	var postfix string
+	postfix := " bit/s"
 	if size > 1000 {
 		postfix = "kbit/s"
 		size /= 1000
@@ -156,7 +148,30 @@ func humanReadable(size float32) string {
 	return fmt.Sprintf("%.2f%s", size, postfix)
 }
 
-func (u *UdpProxy) startBandwidthReporter() {
+// func (u *UdpProxy) startBandwidthReporter() {
+// 	var totalSize int
+// 	var count int
+
+// 	lastTime := time.Now()
+// 	timeout := time.After(1 * time.Second)
+
+// 	for {
+// 		select {
+
+// 		case <-timeout:
+// 			avg := float32(totalSize) / float32(time.Since(lastTime).Seconds())
+// 			fmt.Printf("Avg: %s (%d)\n", humanReadable(avg), count)
+// 			totalSize = 0
+// 			count = 0
+// 			lastTime = time.Now()
+// 			timeout = time.After(1 * time.Second)
+// 		}
+// 	}
+// }
+
+func (u *udpProxyReporter) startReporter() {
+	var lost uint32
+	var good uint32
 	var totalSize int
 	var count int
 
@@ -172,24 +187,6 @@ func (u *UdpProxy) startBandwidthReporter() {
 			totalSize += size
 			count++
 
-		case <-timeout:
-			avg := float32(totalSize) / float32(time.Since(lastTime).Seconds())
-			fmt.Printf("Avg: %s (%d)\n", humanReadable(avg), count)
-			totalSize = 0
-			count = 0
-			lastTime = time.Now()
-			timeout = time.After(1 * time.Second)
-		}
-	}
-}
-
-func (u *udpProxyReporter) startReporter() {
-	var lost uint32
-	var good uint32
-	timeout := time.After(1 * time.Second)
-
-	for {
-		select {
 		case _, ok := <-u.loss:
 			if ok == false {
 				return
@@ -203,15 +200,24 @@ func (u *udpProxyReporter) startReporter() {
 			good++
 
 		case <-timeout:
+			avg := float32(totalSize) / float32(time.Since(lastTime).Seconds())
+
 			var perc float32
 			if good > 0 {
 				perc = (float32(lost) / float32(good+lost))
 			} else {
 				perc = 1
 			}
-			fmt.Printf("Loss: %3.1f\n", perc*100.0)
+
+			perc = perc * float32(time.Since(lastTime).Seconds()) * 100.0
+
+			fmt.Printf("Loss: %5.1f -- Avg: %s (%d pkts)\n", perc, humanReadable(avg), count)
+
+			totalSize = 0
+			count = 0
 			good = 0
 			lost = 0
+			lastTime = time.Now()
 			timeout = time.After(1 * time.Second)
 		}
 	}
